@@ -1,7 +1,7 @@
 //! Authentication and authorization.
 
 use anyhow::Result;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -43,7 +43,7 @@ pub fn create_jwt(
 
 /// Validate JWT and return (device_id, admin_id, role).
 pub fn validate_jwt(token: &str, secret: &str) -> Result<Option<(Uuid, Uuid, String)>> {
-    let mut validation = Validation::default();
+    let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
     let data = decode::<Claims>(
         token,
@@ -56,6 +56,21 @@ pub fn validate_jwt(token: &str, secret: &str) -> Result<Option<(Uuid, Uuid, Str
             let admin_id = Uuid::parse_str(&data.claims.admin_id)?;
             Ok(Some((device_id, admin_id, data.claims.role)))
         }
+        Err(_) => Ok(None),
+    }
+}
+
+/// Decode JWT ignoring expiration (for refresh flow). Returns claims if signature is valid.
+pub fn decode_jwt_ignore_exp(token: &str, secret: &str) -> Result<Option<Claims>> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = false;
+    let data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    );
+    match data {
+        Ok(data) => Ok(Some(data.claims)),
         Err(_) => Ok(None),
     }
 }

@@ -2,13 +2,18 @@
 
 use tokio::sync::broadcast;
 
-use shared::{WsCommandNewPayload, WsCommandUpdatePayload};
+use shared::{
+    WsCommandNewPayload, WsCommandUpdatePayload, WsFileReadRequestPayload,
+    WsFileSearchRequestPayload,
+};
 
 /// Message to broadcast to WebSocket clients.
 #[derive(Debug, Clone)]
 pub enum BroadcastMessage {
     CommandNew(WsCommandNewPayload),
     CommandUpdate(WsCommandUpdatePayload),
+    FileReadRequest(WsFileReadRequestPayload),
+    FileSearchRequest(WsFileSearchRequestPayload),
 }
 
 /// Relay state: broadcast channel for WebSocket messages.

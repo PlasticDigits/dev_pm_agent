@@ -42,6 +42,8 @@ pub struct CreateCommandRequest {
     pub context_mode: Option<String>,
     pub translator_model: Option<String>,
     pub workload_model: Option<String>,
+    /// When set, executor resumes this Cursor chat instead of creating a new one.
+    pub cursor_chat_id: Option<String>,
 }
 
 /// Command response (full details).
@@ -57,6 +59,7 @@ pub struct CommandResponse {
     pub context_mode: Option<String>,
     pub translator_model: Option<String>,
     pub workload_model: Option<String>,
+    pub cursor_chat_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -67,13 +70,16 @@ pub struct UpdateCommandRequest {
     pub status: Option<CommandStatus>,
     pub output: Option<String>,
     pub summary: Option<String>,
+    pub cursor_chat_id: Option<String>,
 }
 
 // --- Auth DTOs ---
 
 /// Setup request (first-run only).
+/// device_api_key must have been registered via CLI (bootstrap-device) first.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupRequest {
+    pub device_api_key: String,
     pub username: String,
     pub password: String,
 }
@@ -82,7 +88,6 @@ pub struct SetupRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetupResponse {
     pub totp_secret: String,
-    pub device_api_key: String,
 }
 
 /// Login request.
@@ -99,6 +104,18 @@ pub struct LoginResponse {
     pub token: String,
 }
 
+/// Refresh token request (old JWT may be expired but within grace period).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshRequest {
+    pub token: String,
+}
+
+/// Refresh token response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshResponse {
+    pub token: String,
+}
+
 /// Reserve code request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReserveCodeRequest {
@@ -109,6 +126,24 @@ pub struct ReserveCodeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReserveCodeResponse {
     pub expires_at: String,
+}
+
+/// Verify bootstrap device request (web setup step 1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyBootstrapRequest {
+    pub device_api_key: String,
+}
+
+/// Verify bootstrap response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyBootstrapResponse {
+    pub valid: bool,
+}
+
+/// Bootstrap device response (CLI gets device key from this).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapDeviceResponse {
+    pub device_api_key: String,
 }
 
 /// Register device request (executor CLI).
@@ -140,13 +175,31 @@ pub struct WsEnvelope {
 
 /// WebSocket message types.
 pub mod ws_types {
+    pub const AUTH: &str = "auth";
+    pub const AUTH_OK: &str = "auth_ok";
+    pub const AUTH_FAIL: &str = "auth_fail";
     pub const COMMAND_NEW: &str = "command_new";
     pub const COMMAND_UPDATE: &str = "command_update";
     pub const COMMAND_ACK: &str = "command_ack";
     pub const COMMAND_RESULT: &str = "command_result";
+    pub const FILE_READ_REQUEST: &str = "file_read_request";
+    pub const FILE_SEARCH_REQUEST: &str = "file_search_request";
     pub const PING: &str = "ping";
     pub const PONG: &str = "pong";
     pub const ERROR: &str = "error";
+}
+
+/// Auth message payload (client → server).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsAuthPayload {
+    pub token: String,
+}
+
+/// Single turn in chat history (user input + assistant output).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatHistoryEntry {
+    pub input: String,
+    pub output: Option<String>,
 }
 
 /// command_new payload.
@@ -158,6 +211,11 @@ pub struct WsCommandNewPayload {
     pub context_mode: Option<String>,
     pub translator_model: Option<String>,
     pub workload_model: Option<String>,
+    /// Resume this Cursor chat (skip create-chat when set).
+    pub cursor_chat_id: Option<String>,
+    /// Prior turns in this chat (for translator context). Present when resuming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_history: Option<Vec<ChatHistoryEntry>>,
 }
 
 /// command_update payload.
@@ -167,6 +225,8 @@ pub struct WsCommandUpdatePayload {
     pub status: String,
     pub output: Option<String>,
     pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_chat_id: Option<String>,
     pub updated_at: String,
 }
 
@@ -185,11 +245,66 @@ pub struct WsCommandResultPayload {
     pub summary: String,
 }
 
+/// file_read_request payload (relayer → executor).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsFileReadRequestPayload {
+    pub request_id: Uuid,
+    pub repo_path: String,
+    pub file_path: String,
+}
+
+/// File read response (executor → relayer via HTTP POST).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileReadResponseRequest {
+    pub request_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// file_search_request payload (relayer → executor).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsFileSearchRequestPayload {
+    pub request_id: Uuid,
+    pub repo_path: String,
+    pub file_name: String,
+}
+
+/// Single file search match: path relative to repo root, modified timestamp (ISO8601).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSearchMatch {
+    pub path: String,
+    pub modified_at: String,
+}
+
+/// File search response (executor → relayer via HTTP POST).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSearchResponseRequest {
+    pub request_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matches: Option<Vec<FileSearchMatch>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Add repo request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddRepoRequest {
     pub path: String,
     pub name: Option<String>,
+}
+
+/// Sync repos request (executor). Replaces admin's repos with listed paths from ~/repos/.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncReposRequest {
+    pub paths: Vec<String>,
+}
+
+/// Sync models request (executor). Replaces cached model list from `agent models`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncModelsRequest {
+    pub models: Vec<String>,
 }
 
 /// Repo response.
@@ -219,6 +334,7 @@ mod tests {
             context_mode: Some("continue".to_string()),
             translator_model: Some("claude-4".to_string()),
             workload_model: Some("cursor".to_string()),
+            cursor_chat_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: CreateCommandRequest = serde_json::from_str(&json).unwrap();
@@ -241,6 +357,7 @@ mod tests {
             context_mode: None,
             translator_model: None,
             workload_model: None,
+            cursor_chat_id: None,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:01Z".to_string(),
         };
@@ -267,7 +384,6 @@ mod tests {
     fn setup_response_serde_roundtrip() {
         let resp = SetupResponse {
             totp_secret: "JBSWY3DPEHPK3PXP".to_string(),
-            device_api_key: (0..64).map(|_| 'a').collect::<String>(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: SetupResponse = serde_json::from_str(&json).unwrap();

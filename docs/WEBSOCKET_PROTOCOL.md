@@ -121,7 +121,22 @@ Executor sends final result. Relayer stores and broadcasts `command_update` to c
 }
 ```
 
-### 3.5 `ping` / `pong`
+### 3.5 `file_read_request` (Relayer → Executor)
+
+Sent when a controller requests to read a file from a repo. Executor reads the file from disk and POSTs the content to `/api/files/read/response`.
+
+```json
+{
+  "type": "file_read_request",
+  "payload": {
+    "request_id": "uuid",
+    "repo_path": "~/repos/foo",
+    "file_path": "plans/PLAN_GAP_1.md"
+  }
+}
+```
+
+### 3.6 `ping` / `pong`
 
 Keepalive. Either side may send `ping`; receiver responds with `pong`.
 
@@ -130,7 +145,7 @@ Keepalive. Either side may send `ping`; receiver responds with `pong`.
 { "type": "pong", "payload": {} }
 ```
 
-### 3.6 `error`
+### 3.7 `error`
 
 Server or executor reports an error.
 

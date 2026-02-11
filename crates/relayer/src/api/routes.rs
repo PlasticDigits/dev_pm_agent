@@ -10,34 +10,112 @@ use axum::{
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use uuid::Uuid;
 
 use shared::{
-    AddRepoRequest, CreateCommandRequest, LoginRequest, LoginResponse, RegisterDeviceRequest,
-    RegisterDeviceResponse, ReserveCodeRequest, ReserveCodeResponse, SetupRequest, SetupResponse,
-    UpdateCommandRequest,
+    AddRepoRequest, BootstrapDeviceResponse, CreateCommandRequest, FileReadResponseRequest,
+    FileSearchResponseRequest, LoginRequest, LoginResponse, RefreshRequest, RefreshResponse,
+    RegisterDeviceRequest, RegisterDeviceResponse, ReserveCodeRequest, ReserveCodeResponse,
+    SetupRequest, SetupResponse, SyncModelsRequest, SyncReposRequest, UpdateCommandRequest,
+    VerifyBootstrapRequest, VerifyBootstrapResponse, WsFileReadRequestPayload,
+    WsFileSearchRequestPayload,
 };
 use shared::{CommandResponse, CommandStatus, RepoResponse};
 
 use crate::api::AppState;
-use crate::auth::{create_jwt, generate_api_key, generate_totp_secret, hash_api_key, verify_totp};
+use crate::auth::{
+    create_jwt, decode_jwt_ignore_exp, generate_api_key, generate_totp_secret, hash_api_key,
+    verify_totp,
+};
 use crate::db;
 use crate::relay::BroadcastMessage;
 
+/// Per-IP rate limit for auth endpoints: 5 requests per burst, 1 replenish every 15 seconds.
+/// Mitigates brute-force on passwords, API keys, TOTP codes, and token stuffing.
+fn auth_rate_limit_layer() -> GovernorLayer<
+    tower_governor::key_extractor::PeerIpKeyExtractor,
+    governor::middleware::NoOpMiddleware,
+    axum::body::Body,
+> {
+    let config = GovernorConfigBuilder::default()
+        .per_second(15)
+        .burst_size(5)
+        .finish()
+        .expect("invalid governor config");
+    GovernorLayer::new(config)
+}
+
 pub fn api_routes() -> Router<AppState> {
-    Router::new()
+    let auth_routes = Router::new()
+        .route("/auth/bootstrap-device", post(auth_bootstrap_device))
+        .route("/auth/verify-bootstrap", post(auth_verify_bootstrap))
         .route("/auth/setup", post(auth_setup))
         .route("/auth/login", post(auth_login))
+        .route("/auth/refresh", post(auth_refresh))
         .route("/auth/register-device", post(auth_register_device))
+        .layer(auth_rate_limit_layer());
+
+    Router::new()
+        .merge(auth_routes)
         .route("/devices/reserve-code", post(devices_reserve_code))
         .route("/commands", post(commands_create).get(commands_list))
-        .route("/commands/:id", get(commands_get).patch(commands_update))
+        .route(
+            "/commands/{id}",
+            get(commands_get)
+                .patch(commands_update)
+                .delete(commands_delete),
+        )
         .route("/repos", get(repos_list).post(repos_add))
-        .route("/models", get(models_list))
+        .route("/repos/sync", post(repos_sync))
+        .route("/models", get(models_list).post(models_sync))
+        .route("/files/read", get(files_read))
+        .route("/files/read/response", post(files_read_response))
+        .route("/files/search", get(files_search))
+        .route("/files/search/response", post(files_search_response))
 }
 
 // --- Auth ---
+
+/// Bootstrap device: generate device key, store in bootstrap_devices.
+/// Requires EXECUTOR_API_KEY. Only when no admin exists.
+async fn auth_bootstrap_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(_req): Json<serde_json::Value>,
+) -> Result<Json<BootstrapDeviceResponse>, (StatusCode, String)> {
+    let token = extract_bearer_from_headers(&headers)?;
+    if token != state.config.executor_api_key {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid executor api key".to_string(),
+        ));
+    }
+    let conn = state.db.0.lock().unwrap();
+    if db::admin_exists(&conn).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))? {
+        return Err((StatusCode::FORBIDDEN, "setup already completed".to_string()));
+    }
+    let device_api_key = generate_api_key();
+    let device_api_key_hash = hash_api_key(&device_api_key)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    db::insert_bootstrap_device(&conn, &device_api_key_hash)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(BootstrapDeviceResponse { device_api_key }))
+}
+
+/// Verify bootstrap: check if device key exists in bootstrap_devices.
+async fn auth_verify_bootstrap(
+    State(state): State<AppState>,
+    Json(req): Json<VerifyBootstrapRequest>,
+) -> Result<Json<VerifyBootstrapResponse>, (StatusCode, String)> {
+    let conn = state.db.0.lock().unwrap();
+    if db::admin_exists(&conn).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))? {
+        return Err((StatusCode::FORBIDDEN, "setup already completed".to_string()));
+    }
+    let valid = db::exists_bootstrap_device(&conn, &req.device_api_key)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(VerifyBootstrapResponse { valid }))
+}
 
 async fn auth_setup(
     State(state): State<AppState>,
@@ -47,13 +125,29 @@ async fn auth_setup(
     if db::admin_exists(&conn).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))? {
         return Err((StatusCode::FORBIDDEN, "setup already completed".to_string()));
     }
-    let password_hash = bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)
+    if !db::exists_bootstrap_device(&conn, &req.device_api_key)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "device key not registered. Run bootstrap-device first.".to_string(),
+        ));
+    }
+    if !db::take_bootstrap_device(&conn, &req.device_api_key)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "device key already used".to_string(),
+        ));
+    }
+    let device_api_key_hash = hash_api_key(&req.device_api_key)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let salted = format!("{}{}", state.config.password_salt, req.password);
+    let password_hash = bcrypt::hash(&salted, bcrypt::DEFAULT_COST)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let totp_secret =
         generate_totp_secret().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let device_api_key = generate_api_key();
-    let device_api_key_hash = hash_api_key(&device_api_key)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     db::setup_admin(
         &conn,
         &req.username,
@@ -62,20 +156,15 @@ async fn auth_setup(
         &device_api_key_hash,
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(SetupResponse {
-        totp_secret,
-        device_api_key,
-    }))
+    Ok(Json(SetupResponse { totp_secret }))
 }
 
 async fn auth_login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, String)> {
-    let api_key_hash = hash_api_key(&req.device_api_key)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let conn = state.db.0.lock().unwrap();
-    let Some((device_id, admin_id, _role)) = db::validate_device(&conn, &api_key_hash)
+    let Some((device_id, admin_id, _role)) = db::validate_device(&conn, &req.device_api_key)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     else {
         return Err((StatusCode::UNAUTHORIZED, "invalid device".to_string()));
@@ -87,7 +176,8 @@ async fn auth_login(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid credentials".to_string()))?;
-    if !bcrypt::verify(&req.password, &password_hash).unwrap_or(false) {
+    let salted = format!("{}{}", state.config.password_salt, req.password);
+    if !bcrypt::verify(&salted, &password_hash).unwrap_or(false) {
         return Err((StatusCode::UNAUTHORIZED, "invalid credentials".to_string()));
     }
     if !verify_totp(&totp_secret, &req.totp_code) {
@@ -102,6 +192,42 @@ async fn auth_login(
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(LoginResponse { token }))
+}
+
+/// Refresh JWT. Accepts an expired token if within grace period (default 24h).
+async fn auth_refresh(
+    State(state): State<AppState>,
+    Json(req): Json<RefreshRequest>,
+) -> Result<Json<RefreshResponse>, (StatusCode, String)> {
+    let Some(claims) = decode_jwt_ignore_exp(&req.token, &state.config.jwt_secret)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    else {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .as_secs() as i64;
+    let grace = state.config.jwt_refresh_grace_secs as i64;
+    if claims.exp < now - grace {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "token expired beyond refresh window".to_string(),
+        ));
+    }
+    let device_id = Uuid::parse_str(&claims.sub)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let admin_id = Uuid::parse_str(&claims.admin_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let token = create_jwt(
+        device_id,
+        admin_id,
+        &claims.role,
+        &state.config.jwt_secret,
+        state.config.jwt_ttl_secs as u64,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(RefreshResponse { token }))
 }
 
 async fn auth_register_device(
@@ -120,9 +246,14 @@ async fn auth_register_device(
     let device_api_key_hash = hash_api_key(&device_api_key)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let conn = state.db.0.lock().unwrap();
-    let Some(totp_secret) =
-        db::register_device(&conn, &req.code, &req.password, &device_api_key_hash)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    let Some(totp_secret) = db::register_device(
+        &conn,
+        &req.code,
+        &req.password,
+        &device_api_key_hash,
+        &state.config.password_salt,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -176,6 +307,7 @@ async fn commands_create(
         req.context_mode.as_deref(),
         req.translator_model.as_deref(),
         req.workload_model.as_deref(),
+        req.cursor_chat_id.as_deref(),
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let cmd = db::get_command(&conn, id)
@@ -202,19 +334,36 @@ async fn commands_create(
         context_mode: cmd.7.clone(),
         translator_model: cmd.8.clone(),
         workload_model: cmd.9.clone(),
-        created_at: cmd.10.clone(),
-        updated_at: cmd.11.clone(),
+        cursor_chat_id: cmd.10.clone(),
+        created_at: cmd.11.clone(),
+        updated_at: cmd.12.clone(),
     };
+    // Fetch chat history when resuming a chat (for translator context)
+    let chat_history = if let Some(ref cid) = req.cursor_chat_id {
+        db::list_commands_by_cursor_chat_id(&conn, device_id, cid)
+            .ok()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(input, output)| shared::ChatHistoryEntry { input, output })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<_>| !v.is_empty())
+    } else {
+        None
+    };
+
     // Broadcast to executor
     state
         .relay
         .broadcast(BroadcastMessage::CommandNew(shared::WsCommandNewPayload {
             id,
-            input: req.input,
-            repo_path: req.repo_path,
-            context_mode: req.context_mode,
-            translator_model: req.translator_model,
-            workload_model: req.workload_model,
+            input: req.input.clone(),
+            repo_path: req.repo_path.clone(),
+            context_mode: req.context_mode.clone(),
+            translator_model: req.translator_model.clone(),
+            workload_model: req.workload_model.clone(),
+            cursor_chat_id: req.cursor_chat_id.clone(),
+            chat_history,
         }));
     Ok(Json(response))
 }
@@ -249,8 +398,9 @@ async fn commands_list(
                 context_mode: c.7,
                 translator_model: c.8,
                 workload_model: c.9,
-                created_at: c.10,
-                updated_at: c.11,
+                cursor_chat_id: c.10,
+                created_at: c.11,
+                updated_at: c.12,
             }
         })
         .collect();
@@ -270,7 +420,7 @@ async fn commands_get(
     else {
         return Err((StatusCode::NOT_FOUND, "command not found".to_string()));
     };
-    // TODO: verify admin_id matches
+    // Single-admin design: any authenticated user can access any command (no per-device isolation).
     let status = match cmd.3.as_str() {
         "pending" => CommandStatus::Pending,
         "running" => CommandStatus::Running,
@@ -289,11 +439,14 @@ async fn commands_get(
         context_mode: cmd.7,
         translator_model: cmd.8,
         workload_model: cmd.9,
-        created_at: cmd.10,
-        updated_at: cmd.11,
+        cursor_chat_id: cmd.10,
+        created_at: cmd.11,
+        updated_at: cmd.12,
     }))
 }
 
+/// Update command status/output/summary. EXECUTOR_API_KEY only.
+/// Controllers must not update command status—return 403 for JWT tokens.
 async fn commands_update(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -301,16 +454,30 @@ async fn commands_update(
     Json(req): Json<UpdateCommandRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let token = extract_bearer_from_headers(&headers)?;
-    let (_, admin_id, _) = verify_bearer(&token, &state)?;
+    if token != state.config.executor_api_key {
+        if crate::auth::validate_jwt(&token, &state.config.jwt_secret)
+            .map(|o| o.is_some())
+            .unwrap_or(false)
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "controller cannot update command status".to_string(),
+            ));
+        }
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid executor api key".to_string(),
+        ));
+    }
     let conn = state.db.0.lock().unwrap();
     let status = req.status.as_ref().map(|s| s.as_str());
-    let _ = admin_id;
     db::update_command(
         &conn,
         id,
         status,
         req.output.as_deref(),
         req.summary.as_deref(),
+        req.cursor_chat_id.as_deref(),
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -320,16 +487,30 @@ async fn commands_update(
             status: status.unwrap_or("").to_string(),
             output: req.output,
             summary: req.summary,
+            cursor_chat_id: req.cursor_chat_id.clone(),
             updated_at: now,
         },
     ));
     Ok(StatusCode::NO_CONTENT)
 }
 
-// --- Models ---
+async fn commands_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token = extract_bearer_from_headers(&headers)?;
+    let (_, admin_id, _) = verify_bearer(&token, &state)?;
+    let conn = state.db.0.lock().unwrap();
+    let deleted = db::delete_command(&conn, id, admin_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, "command not found".to_string()));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
 
-/// Static model list. Can later be replaced with executor query or config.
-const MODELS: &[&str] = &["composer-1.5", "claude-4", "claude-3.5-sonnet", "gpt-4o"];
+// --- Models ---
 
 async fn models_list(
     State(state): State<AppState>,
@@ -337,7 +518,42 @@ async fn models_list(
 ) -> Result<Json<Vec<String>>, (StatusCode, String)> {
     let token = extract_bearer_from_headers(&headers)?;
     let _ = verify_bearer(&token, &state)?;
-    Ok(Json(MODELS.iter().map(|s| (*s).to_string()).collect()))
+    let models = state.models.read().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("models lock: {}", e),
+        )
+    })?;
+    Ok(Json(models.clone()))
+}
+
+/// Sync models from executor. Requires EXECUTOR_API_KEY. Replaces cached model list.
+async fn models_sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SyncModelsRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token = extract_bearer_from_headers(&headers)?;
+    if token != state.config.executor_api_key {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid executor api key".to_string(),
+        ));
+    }
+    if req.models.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "models list must not be empty".to_string(),
+        ));
+    }
+    let mut models = state.models.write().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("models lock: {}", e),
+        )
+    })?;
+    *models = req.models;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- Repos ---
@@ -376,50 +592,277 @@ async fn repos_add(
     Ok(StatusCode::CREATED)
 }
 
-// --- WebSocket ---
+// --- Files ---
 
-#[derive(Debug, Deserialize)]
-pub struct WsQuery {
-    token: Option<String>,
+#[derive(serde::Deserialize)]
+struct FilesReadQuery {
+    repo_path: String,
+    file_path: String,
 }
+
+#[derive(serde::Deserialize)]
+struct FilesSearchQuery {
+    repo_path: String,
+    file_name: String,
+}
+
+/// Read file from repo. Requires JWT (controller). Relayer forwards to executor via WebSocket.
+async fn files_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<FilesReadQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _ = extract_bearer_from_headers(&headers).and_then(|t| verify_bearer(&t, &state))?;
+    if q.repo_path.is_empty() || q.file_path.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "repo_path and file_path required".to_string(),
+        ));
+    }
+    let request_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut pending = state.file_read_pending.write().unwrap();
+        pending.insert(request_id, tx);
+    }
+    state.relay.broadcast(BroadcastMessage::FileReadRequest(
+        WsFileReadRequestPayload {
+            request_id,
+            repo_path: q.repo_path.clone(),
+            file_path: q.file_path.clone(),
+        },
+    ));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), rx).await;
+    {
+        let mut pending = state.file_read_pending.write().unwrap();
+        pending.remove(&request_id);
+    }
+    match result {
+        Ok(Ok(Ok(content))) => Ok(Json(serde_json::json!({ "content": content }))),
+        Ok(Ok(Err(e))) => Err((StatusCode::BAD_REQUEST, e)),
+        Ok(Err(_)) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "executor did not respond in time".to_string(),
+        )),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "executor did not respond in time".to_string(),
+        )),
+    }
+}
+
+/// Executor responds with file content. Requires EXECUTOR_API_KEY.
+async fn files_read_response(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<FileReadResponseRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token = extract_bearer_from_headers(&headers)?;
+    if token != state.config.executor_api_key {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid executor api key".to_string(),
+        ));
+    }
+    let mut pending = state.file_read_pending.write().unwrap();
+    let tx = pending.remove(&req.request_id).ok_or((
+        StatusCode::NOT_FOUND,
+        "request not found or expired".to_string(),
+    ))?;
+    drop(pending);
+    let result = if let Some(e) = req.error {
+        Err(e)
+    } else if let Some(c) = req.content {
+        Ok(c)
+    } else {
+        Err("missing content and error".to_string())
+    };
+    let _ = tx.send(result);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Search repo for files by name. Requires JWT (controller). Relayer forwards to executor via WebSocket.
+async fn files_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<FilesSearchQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _ = extract_bearer_from_headers(&headers).and_then(|t| verify_bearer(&t, &state))?;
+    if q.repo_path.is_empty() || q.file_name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "repo_path and file_name required".to_string(),
+        ));
+    }
+    let request_id = Uuid::new_v4();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut pending = state.file_search_pending.write().unwrap();
+        pending.insert(request_id, tx);
+    }
+    state.relay.broadcast(BroadcastMessage::FileSearchRequest(
+        WsFileSearchRequestPayload {
+            request_id,
+            repo_path: q.repo_path.clone(),
+            file_name: q.file_name.clone(),
+        },
+    ));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(120), rx).await;
+    {
+        let mut pending = state.file_search_pending.write().unwrap();
+        pending.remove(&request_id);
+    }
+    match result {
+        Ok(Ok(Ok(matches))) => Ok(Json(serde_json::json!({ "matches": matches }))),
+        Ok(Ok(Err(e))) => Err((StatusCode::BAD_REQUEST, e)),
+        Ok(Err(_)) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "executor did not respond in time".to_string(),
+        )),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "executor did not respond in time".to_string(),
+        )),
+    }
+}
+
+/// Executor responds with file search results. Requires EXECUTOR_API_KEY.
+async fn files_search_response(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<FileSearchResponseRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token = extract_bearer_from_headers(&headers)?;
+    if token != state.config.executor_api_key {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid executor api key".to_string(),
+        ));
+    }
+    let mut pending = state.file_search_pending.write().unwrap();
+    let tx = pending.remove(&req.request_id).ok_or((
+        StatusCode::NOT_FOUND,
+        "request not found or expired".to_string(),
+    ))?;
+    drop(pending);
+    let result = if let Some(e) = req.error {
+        Err(e)
+    } else if let Some(m) = req.matches {
+        Ok(m)
+    } else {
+        Err("missing matches and error".to_string())
+    };
+    let _ = tx.send(result);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sync repos from executor. Requires EXECUTOR_API_KEY. Replaces admin's repos with paths.
+async fn repos_sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SyncReposRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let token = extract_bearer_from_headers(&headers)?;
+    if token != state.config.executor_api_key {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid executor api key".to_string(),
+        ));
+    }
+    let conn = state.db.0.lock().unwrap();
+    let admin_id: String = conn
+        .query_row("SELECT id FROM admin LIMIT 1", [], |row| row.get(0))
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "no admin".to_string()))?;
+    let admin_id = Uuid::parse_str(&admin_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    db::replace_repos(&conn, admin_id, &req.paths)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- WebSocket ---
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
-    Query(q): Query<WsQuery>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, q.token, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, token: Option<String>, state: AppState) {
-    let token = token.filter(|t| !t.is_empty());
-    if token.is_none() {
-        return;
-    }
-    let token = token.unwrap();
-    // Validate: JWT (controller) or EXECUTOR_API_KEY (executor)
-    let (_device_id, _admin_id, _role) = if token == state.config.executor_api_key {
-        // Executor - we need admin_id. For single-admin, we get from first admin.
-        let conn = state.db.0.lock().unwrap();
-        let admin_id: Option<String> = conn
-            .query_row("SELECT id FROM admin LIMIT 1", [], |row| row.get(0))
-            .ok();
-        match admin_id {
-            Some(a) => (
-                Uuid::nil(),
-                Uuid::parse_str(&a).unwrap_or(Uuid::nil()),
-                "executor".to_string(),
-            ),
-            None => return,
+/// Expect first message to be {"type":"auth","payload":{"token":"..."}}. Validate token,
+/// send auth_ok or auth_fail, then subscribe to relay only if valid.
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    let token = match ws_rx.next().await {
+        Some(Ok(Message::Text(t))) => {
+            let envelope: Result<shared::WsEnvelope, _> = serde_json::from_str(&t);
+            match envelope {
+                Ok(e) if e.r#type == shared::ws_types::AUTH => e
+                    .payload
+                    .get("token")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                _ => None,
+            }
         }
-    } else {
-        match crate::auth::validate_jwt(&token, &state.config.jwt_secret) {
-            Ok(Some((d, a, r))) => (d, a, r),
-            _ => return,
+        _ => None,
+    };
+
+    let token = match token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            let _ = ws_tx
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": shared::ws_types::AUTH_FAIL,
+                        "payload": {"reason": "missing or invalid auth message"}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            return;
         }
     };
+
+    // Validate: JWT (controller) or EXECUTOR_API_KEY (executor)
+    let valid = if token == state.config.executor_api_key {
+        let conn = state.db.0.lock().unwrap();
+        conn.query_row("SELECT id FROM admin LIMIT 1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+        .is_some()
+    } else {
+        crate::auth::validate_jwt(&token, &state.config.jwt_secret)
+            .map(|o| o.is_some())
+            .unwrap_or(false)
+    };
+
+    if !valid {
+        let _ = ws_tx
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": shared::ws_types::AUTH_FAIL,
+                    "payload": {"reason": "invalid token"}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        return;
+    }
+
+    let _ = ws_tx
+        .send(Message::Text(
+            serde_json::json!({"type": shared::ws_types::AUTH_OK, "payload": {}})
+                .to_string()
+                .into(),
+        ))
+        .await;
+
     let mut rx = state.relay.subscribe();
-    let (mut ws_tx, mut ws_rx) = socket.split();
     tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let json = match &msg {
@@ -435,9 +878,25 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: AppState
                     payload: serde_json::to_value(p).unwrap(),
                     ts: Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
                 }),
+                BroadcastMessage::FileReadRequest(p) => {
+                    serde_json::to_string(&shared::WsEnvelope {
+                        version: 1,
+                        r#type: shared::ws_types::FILE_READ_REQUEST.to_string(),
+                        payload: serde_json::to_value(p).unwrap(),
+                        ts: Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+                    })
+                }
+                BroadcastMessage::FileSearchRequest(p) => {
+                    serde_json::to_string(&shared::WsEnvelope {
+                        version: 1,
+                        r#type: shared::ws_types::FILE_SEARCH_REQUEST.to_string(),
+                        payload: serde_json::to_value(p).unwrap(),
+                        ts: Some(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+                    })
+                }
             };
             if let Ok(j) = json {
-                let _ = ws_tx.send(Message::Text(j)).await;
+                let _ = ws_tx.send(Message::Text(j.into())).await;
             }
         }
     });
@@ -476,4 +935,172 @@ fn verify_bearer(
     crate::auth::validate_jwt(token, &state.config.jwt_secret)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::UNAUTHORIZED, "invalid token".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{router, AppState};
+    use crate::auth::{create_jwt, generate_api_key, generate_totp_secret, hash_api_key};
+    use crate::config::Config;
+    use crate::db;
+    use crate::relay::RelayState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::env;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn client_hash(password: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update("test-salt".as_bytes());
+        hasher.update(b":dev-pm-agent:");
+        hasher.update(password.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn commands_update_rejects_controller_jwt() {
+        let executor_key = "test-executor-key-abc";
+        let jwt_secret = "test-jwt-secret-xyz";
+        let salt = "test-salt";
+
+        let migrations_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("migrations")
+            .canonicalize()
+            .unwrap();
+        env::set_var("MIGRATIONS_DIR", migrations_dir);
+
+        let db_path = std::env::temp_dir().join(format!("relayer_test_{}.db", Uuid::new_v4()));
+        let config = Config::for_test(db_path.clone(), jwt_secret, executor_key, salt);
+        let config = Arc::new(config);
+
+        let db = db::Db::open(&db_path).unwrap();
+        db.run_migrations().unwrap();
+        let db = Arc::new(db);
+
+        let api_key = generate_api_key();
+        let api_key_hash = hash_api_key(&api_key).unwrap();
+        let totp_secret = generate_totp_secret().unwrap();
+        let ch = client_hash("p");
+        let password_hash = bcrypt::hash(format!("{}{}", salt, ch), bcrypt::DEFAULT_COST).unwrap();
+
+        let conn = db.0.lock().unwrap();
+        db::setup_admin(&conn, "admin1", &password_hash, &totp_secret, &api_key_hash).unwrap();
+        let (device_id, admin_id, _) = db::validate_device(&conn, &api_key).unwrap().unwrap();
+        let cmd_id =
+            db::create_command(&conn, device_id, "test input", None, None, None, None, None)
+                .unwrap();
+        drop(conn);
+
+        let controller_jwt =
+            create_jwt(device_id, admin_id, "controller", &config.jwt_secret, 3600).unwrap();
+
+        let state = AppState {
+            db: db.clone(),
+            relay: Arc::new(RelayState::new()),
+            config: config.clone(),
+            models: Arc::new(std::sync::RwLock::new(vec!["model1".to_string()])),
+            file_read_pending: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            file_search_pending: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        };
+
+        let app = router(state);
+
+        let body = serde_json::json!({
+            "status": "done",
+            "output": "forged",
+            "summary": "forged"
+        });
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/commands/{}", cmd_id))
+            .header("Authorization", format!("Bearer {}", controller_jwt))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "controller JWT must not be allowed to update command status"
+        );
+    }
+
+    #[tokio::test]
+    async fn commands_update_accepts_executor_api_key() {
+        let executor_key = "test-executor-key-def";
+        let jwt_secret = "test-jwt-secret-uvw";
+        let salt = "test-salt";
+
+        let migrations_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("migrations")
+            .canonicalize()
+            .unwrap();
+        env::set_var("MIGRATIONS_DIR", migrations_dir);
+
+        let db_path = std::env::temp_dir().join(format!("relayer_test_{}.db", Uuid::new_v4()));
+        let config = Config::for_test(db_path.clone(), jwt_secret, executor_key, salt);
+        let config = Arc::new(config);
+
+        let db = db::Db::open(&db_path).unwrap();
+        db.run_migrations().unwrap();
+        let db = Arc::new(db);
+
+        let api_key = generate_api_key();
+        let api_key_hash = hash_api_key(&api_key).unwrap();
+        let totp_secret = generate_totp_secret().unwrap();
+        let ch = client_hash("p");
+        let password_hash = bcrypt::hash(format!("{}{}", salt, ch), bcrypt::DEFAULT_COST).unwrap();
+
+        let conn = db.0.lock().unwrap();
+        db::setup_admin(&conn, "admin1", &password_hash, &totp_secret, &api_key_hash).unwrap();
+        let (device_id, _, _) = db::validate_device(&conn, &api_key).unwrap().unwrap();
+        let cmd_id =
+            db::create_command(&conn, device_id, "test input", None, None, None, None, None)
+                .unwrap();
+        drop(conn);
+
+        let state = AppState {
+            db: db.clone(),
+            relay: Arc::new(RelayState::new()),
+            config: config.clone(),
+            models: Arc::new(std::sync::RwLock::new(vec!["model1".to_string()])),
+            file_read_pending: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            file_search_pending: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        };
+
+        let app = router(state);
+
+        let body = serde_json::json!({
+            "status": "done",
+            "output": "ok",
+            "summary": "ok"
+        });
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/commands/{}", cmd_id))
+            .header("Authorization", format!("Bearer {}", executor_key))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "executor API key must be allowed to update command status"
+        );
+    }
 }

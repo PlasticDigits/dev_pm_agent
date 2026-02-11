@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 shared = { path = "../shared" }
-axum = { version = "0.7", features = ["ws", "json"] }
+axum = { version = "0.8", features = ["ws", "json"] }
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -30,3 +30,10 @@ shellexpand = "2"
 rand = "0.8"
 base32 = "0.4"
 futures-util = "0.3"
+governor = "0.10"
+tower_governor = { version = "0.8", features = ["axum"] }
+
+[dev-dependencies]
+sha2 = "0.10"
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"

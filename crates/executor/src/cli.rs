@@ -15,6 +15,9 @@ pub enum Commands {
     /// Run the executor daemon (WebSocket client, Cursor CLI) [default]
     Run,
 
+    /// Generate and register a device key for first-run setup (before account exists)
+    BootstrapDevice,
+
     /// Register a new webapp controller device
     RegisterDevice {
         /// Word-style registration code from webapp keygen

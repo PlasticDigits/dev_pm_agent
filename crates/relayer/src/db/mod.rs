@@ -2,9 +2,13 @@
 
 mod migrations;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+
+/// Dummy bcrypt hash for constant-time verification when no match found.
+/// Reduces timing side channel: always perform at least one bcrypt verify.
+const DUMMY_BCRYPT_HASH: &str = "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.VTtTfBd3c9zJWi";
 use rusqlite::{params, Connection};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -26,6 +30,58 @@ impl Db {
 
     pub fn run_migrations(&self) -> Result<()> {
         run_migrations(&self.0.lock().unwrap())
+    }
+}
+
+/// Insert bootstrap device (pre-admin, for first-run setup).
+pub fn insert_bootstrap_device(conn: &Connection, token_hash: &str) -> Result<()> {
+    let now = chrono_iso8601();
+    conn.execute(
+        "INSERT INTO bootstrap_devices (token_hash, created_at) VALUES (?1, ?2)",
+        params![token_hash, now],
+    )?;
+    Ok(())
+}
+
+/// Check if bootstrap device exists (verify plaintext key against stored bcrypt hashes).
+/// Always performs dummy bcrypt when no match to avoid leaking key existence via timing.
+pub fn exists_bootstrap_device(conn: &Connection, api_key: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT token_hash FROM bootstrap_devices")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut found = false;
+    for row in rows {
+        let hash = row?;
+        if bcrypt::verify(api_key, &hash).unwrap_or(false) {
+            found = true;
+        }
+    }
+    if !found {
+        let _ = bcrypt::verify(api_key, DUMMY_BCRYPT_HASH);
+    }
+    Ok(found)
+}
+
+/// Take (delete) bootstrap device matching api_key; returns true if it existed.
+/// Performs constant-time bcrypt when no match to avoid leaking key existence via timing.
+pub fn take_bootstrap_device(conn: &Connection, api_key: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT token_hash FROM bootstrap_devices")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut found_hash: Option<String> = None;
+    for row in rows {
+        let hash = row?;
+        if bcrypt::verify(api_key, &hash).unwrap_or(false) {
+            found_hash = Some(hash);
+        }
+    }
+    if let Some(hash) = found_hash {
+        conn.execute(
+            "DELETE FROM bootstrap_devices WHERE token_hash = ?1",
+            [&hash],
+        )?;
+        Ok(true)
+    } else {
+        let _ = bcrypt::verify(api_key, DUMMY_BCRYPT_HASH);
+        Ok(false)
     }
 }
 
@@ -86,24 +142,36 @@ pub fn get_admin(conn: &Connection, username: &str) -> Result<Option<(String, St
     }
 }
 
-/// Validate device by API key hash; returns (device_id, admin_id, role).
-pub fn validate_device(
-    conn: &Connection,
-    api_key_hash: &str,
-) -> Result<Option<(Uuid, Uuid, String)>> {
-    let mut stmt = conn.prepare("SELECT id, admin_id, role FROM devices WHERE token_hash = ?1")?;
-    let row = stmt.query_row([api_key_hash], |row| {
+/// Validate device by API key (verify plaintext against stored bcrypt hashes).
+/// Returns (device_id, admin_id, role).
+/// Performs constant-time bcrypt when no match to avoid leaking key existence via timing.
+pub fn validate_device(conn: &Connection, api_key: &str) -> Result<Option<(Uuid, Uuid, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, admin_id, role, token_hash FROM devices WHERE token_hash IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |row| {
         Ok((
-            Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
-            Uuid::parse_str(&row.get::<_, String>(1)?).unwrap(),
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
-    });
-    match row {
-        Ok(r) => Ok(Some(r)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e.into()),
+    })?;
+    let mut result = None;
+    for row in rows {
+        let (id, admin_id, role, token_hash) = row?;
+        if bcrypt::verify(api_key, &token_hash).unwrap_or(false) {
+            result = Some((
+                Uuid::parse_str(&id).unwrap(),
+                Uuid::parse_str(&admin_id).unwrap(),
+                role,
+            ));
+        }
     }
+    if result.is_none() {
+        let _ = bcrypt::verify(api_key, DUMMY_BCRYPT_HASH);
+    }
+    Ok(result)
 }
 
 /// Reserve a device registration code.
@@ -124,12 +192,14 @@ pub fn reserve_code(
 }
 
 /// Consume a registration code and create new controller device.
+/// password is the client-hashed value; password_salt is prepended for server-side verification.
 /// Returns totp_secret on success.
 pub fn register_device(
     conn: &Connection,
     code: &str,
     password: &str,
     device_api_key_hash: &str,
+    password_salt: &str,
 ) -> Result<Option<String>> {
     let now = chrono_iso8601();
 
@@ -158,13 +228,14 @@ pub fn register_device(
         |row| row.get(0),
     )?;
 
-    // Verify password (password is plain text from user)
+    // Verify password (password is client-hashed; server salt is prepended)
     let stored_hash: String = conn.query_row(
         "SELECT password_hash FROM admin WHERE id = ?1",
         [&admin_id],
         |row| row.get(0),
     )?;
-    if !bcrypt::verify(password, &stored_hash).unwrap_or(false) {
+    let salted = format!("{}{}", password_salt, password);
+    if !bcrypt::verify(&salted, &stored_hash).unwrap_or(false) {
         return Ok(None);
     }
 
@@ -199,12 +270,13 @@ pub fn create_command(
     context_mode: Option<&str>,
     translator_model: Option<&str>,
     workload_model: Option<&str>,
+    cursor_chat_id: Option<&str>,
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
     let now = chrono_iso8601();
     conn.execute(
-        "INSERT INTO commands (id, device_id, input, status, output, summary, repo_path, context_mode, translator_model, workload_model, created_at, updated_at)
-         VALUES (?1, ?2, ?3, 'pending', NULL, NULL, ?4, ?5, ?6, ?7, ?8, ?8)",
+        "INSERT INTO commands (id, device_id, input, status, output, summary, repo_path, context_mode, translator_model, workload_model, cursor_chat_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'pending', NULL, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
         params![
             id.to_string(),
             device_id.to_string(),
@@ -213,6 +285,7 @@ pub fn create_command(
             context_mode,
             translator_model,
             workload_model,
+            cursor_chat_id,
             now,
         ],
     )?;
@@ -235,12 +308,13 @@ pub fn get_command(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
         String,
         String,
     )>,
 > {
     let mut stmt = conn.prepare(
-        "SELECT id, device_id, input, status, output, summary, repo_path, context_mode, translator_model, workload_model, created_at, updated_at FROM commands WHERE id = ?1",
+        "SELECT id, device_id, input, status, output, summary, repo_path, context_mode, translator_model, workload_model, cursor_chat_id, created_at, updated_at FROM commands WHERE id = ?1",
     )?;
     let row = stmt.query_row([id.to_string()], |row| {
         Ok((
@@ -256,6 +330,7 @@ pub fn get_command(
             row.get(9)?,
             row.get(10)?,
             row.get(11)?,
+            row.get(12)?,
         ))
     });
     match row {
@@ -282,12 +357,13 @@ pub fn list_commands(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
         String,
         String,
     )>,
 > {
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.device_id, c.input, c.status, c.output, c.summary, c.repo_path, c.context_mode, c.translator_model, c.workload_model, c.created_at, c.updated_at
+        "SELECT c.id, c.device_id, c.input, c.status, c.output, c.summary, c.repo_path, c.context_mode, c.translator_model, c.workload_model, c.cursor_chat_id, c.created_at, c.updated_at
          FROM commands c
          JOIN devices d ON c.device_id = d.id
          WHERE d.admin_id = ?1
@@ -308,32 +384,61 @@ pub fn list_commands(
             row.get(9)?,
             row.get(10)?,
             row.get(11)?,
+            row.get(12)?,
         ))
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// Update command status, output, summary.
+/// Delete command by id if it belongs to admin. Returns true if deleted.
+pub fn delete_command(conn: &Connection, id: Uuid, admin_id: Uuid) -> Result<bool> {
+    let rows = conn.execute(
+        "DELETE FROM commands WHERE id = ?1 AND device_id IN (SELECT id FROM devices WHERE admin_id = ?2)",
+        params![id.to_string(), admin_id.to_string()],
+    )?;
+    Ok(rows > 0)
+}
+
+/// Update command status, output, summary, cursor_chat_id.
 pub fn update_command(
     conn: &Connection,
     id: Uuid,
     status: Option<&str>,
     output: Option<&str>,
     summary: Option<&str>,
+    cursor_chat_id: Option<&str>,
 ) -> Result<bool> {
     let now = chrono_iso8601();
     let rows = if let Some(s) = status {
         conn.execute(
-            "UPDATE commands SET status = ?1, output = COALESCE(?2, output), summary = COALESCE(?3, summary), updated_at = ?4 WHERE id = ?5",
-            params![s, output, summary, now, id.to_string()],
+            "UPDATE commands SET status = ?1, output = COALESCE(?2, output), summary = COALESCE(?3, summary), cursor_chat_id = COALESCE(?4, cursor_chat_id), updated_at = ?5 WHERE id = ?6",
+            params![s, output, summary, cursor_chat_id, now, id.to_string()],
         )?
     } else {
         conn.execute(
-            "UPDATE commands SET output = COALESCE(?1, output), summary = COALESCE(?2, summary), updated_at = ?3 WHERE id = ?4",
-            params![output, summary, now, id.to_string()],
+            "UPDATE commands SET output = COALESCE(?1, output), summary = COALESCE(?2, summary), cursor_chat_id = COALESCE(?3, cursor_chat_id), updated_at = ?4 WHERE id = ?5",
+            params![output, summary, cursor_chat_id, now, id.to_string()],
         )?
     };
     Ok(rows > 0)
+}
+
+/// List prior commands in the same chat (by cursor_chat_id and device_id), for translator context.
+/// Returns (input, output) ordered by created_at asc. Excludes commands with no output.
+pub fn list_commands_by_cursor_chat_id(
+    conn: &Connection,
+    device_id: Uuid,
+    cursor_chat_id: &str,
+) -> Result<Vec<(String, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT input, output FROM commands
+         WHERE device_id = ?1 AND cursor_chat_id = ?2 AND status IN ('done', 'failed')
+         ORDER BY created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![device_id.to_string(), cursor_chat_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 /// Get next pending command for executor (by admin_id).
@@ -397,12 +502,42 @@ pub fn list_repos(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// Add repo. Validates path is under ~/repos/
-pub fn add_repo(conn: &Connection, admin_id: Uuid, path: &str, name: Option<&str>) -> Result<Uuid> {
+/// Validates that a repo path is under ~/repos/ with no path traversal.
+/// Expands tilde, normalizes the path (resolves . and ..), and ensures it
+/// starts with $HOME/repos/ or is exactly $HOME/repos.
+fn validate_repo_path(path: &str) -> Result<String> {
     let expanded = shellexpand::tilde(path).to_string();
-    if !expanded.contains("repos") {
-        return Err(anyhow::anyhow!("repo path must be under ~/repos/"));
+    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
+    let base = Path::new(&home).join("repos");
+    let base_str = base.to_string_lossy();
+
+    // Normalize path: resolve . and .. without requiring path to exist
+    let mut normalized = PathBuf::new();
+    for comp in Path::new(&expanded).components() {
+        match comp {
+            Component::Prefix(p) => normalized.push(p.as_os_str()),
+            Component::RootDir => normalized.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(anyhow!("repo path must be under ~/repos/"));
+                }
+            }
+            Component::Normal(c) => normalized.push(c),
+        }
     }
+
+    let norm_str = normalized.to_string_lossy();
+    if norm_str == base_str || norm_str.starts_with(&format!("{}/", base_str)) {
+        Ok(expanded)
+    } else {
+        Err(anyhow!("repo path must be under ~/repos/"))
+    }
+}
+
+/// Add repo. Validates path is under ~/repos/ with strict path checks.
+pub fn add_repo(conn: &Connection, admin_id: Uuid, path: &str, name: Option<&str>) -> Result<Uuid> {
+    let expanded = validate_repo_path(path)?;
     let id = Uuid::new_v4();
     let now = chrono_iso8601();
     conn.execute(
@@ -410,6 +545,26 @@ pub fn add_repo(conn: &Connection, admin_id: Uuid, path: &str, name: Option<&str
         params![id.to_string(), admin_id.to_string(), expanded, name, now],
     )?;
     Ok(id)
+}
+
+/// Replace all repos for admin with given paths. Only paths under ~/repos/ (validated)
+/// are added; invalid paths are skipped.
+pub fn replace_repos(conn: &Connection, admin_id: Uuid, paths: &[String]) -> Result<()> {
+    conn.execute(
+        "DELETE FROM repos WHERE admin_id = ?1",
+        [admin_id.to_string()],
+    )?;
+    let now = chrono_iso8601();
+    for path in paths {
+        if let Ok(expanded) = validate_repo_path(path) {
+            let id = Uuid::new_v4();
+            conn.execute(
+                "INSERT INTO repos (id, admin_id, path, name, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id.to_string(), admin_id.to_string(), expanded, None::<&str>, now],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn chrono_iso8601() -> String {
@@ -420,6 +575,22 @@ fn chrono_iso8601() -> String {
 mod tests {
     use super::*;
     use crate::auth::{generate_api_key, generate_totp_secret, hash_api_key};
+    use sha2::{Digest, Sha256};
+
+    const TEST_CLIENT_SALT: &str = "test-client-salt";
+    const TEST_SERVER_SALT: &str = "test-server-salt";
+
+    fn client_hash(password: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(TEST_CLIENT_SALT.as_bytes());
+        hasher.update(b":dev-pm-agent:");
+        hasher.update(password.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
 
     fn in_memory_db_with_migrations() -> Connection {
         let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -445,7 +616,9 @@ mod tests {
         let api_key = generate_api_key();
         let api_key_hash = hash_api_key(&api_key).unwrap();
         let totp_secret = generate_totp_secret().unwrap();
-        let password_hash = bcrypt::hash("testpass123", bcrypt::DEFAULT_COST).unwrap();
+        let ch = client_hash("testpass123");
+        let password_hash =
+            bcrypt::hash(format!("{}{}", TEST_SERVER_SALT, ch), bcrypt::DEFAULT_COST).unwrap();
 
         setup_admin(&conn, "admin1", &password_hash, &totp_secret, &api_key_hash).unwrap();
 
@@ -458,11 +631,13 @@ mod tests {
         let api_key = generate_api_key();
         let api_key_hash = hash_api_key(&api_key).unwrap();
         let totp_secret = generate_totp_secret().unwrap();
-        let password_hash = bcrypt::hash("testpass123", bcrypt::DEFAULT_COST).unwrap();
+        let ch = client_hash("testpass123");
+        let password_hash =
+            bcrypt::hash(format!("{}{}", TEST_SERVER_SALT, ch), bcrypt::DEFAULT_COST).unwrap();
 
         setup_admin(&conn, "admin1", &password_hash, &totp_secret, &api_key_hash).unwrap();
 
-        let result = validate_device(&conn, &api_key_hash).unwrap();
+        let result = validate_device(&conn, &api_key).unwrap();
         assert!(result.is_some());
         let (device_id, admin_id, role) = result.unwrap();
         assert_eq!(role, "controller");
@@ -472,8 +647,8 @@ mod tests {
     #[test]
     fn validate_device_rejects_unknown_hash() {
         let conn = in_memory_db_with_migrations();
-        let unknown_hash = hash_api_key(&generate_api_key()).unwrap();
-        let result = validate_device(&conn, &unknown_hash).unwrap();
+        let unknown_key = generate_api_key();
+        let result = validate_device(&conn, &unknown_key).unwrap();
         assert!(result.is_none());
     }
 
@@ -483,11 +658,13 @@ mod tests {
         let api_key = generate_api_key();
         let api_key_hash = hash_api_key(&api_key).unwrap();
         let totp_secret = generate_totp_secret().unwrap();
-        let password_hash = bcrypt::hash("regpass", bcrypt::DEFAULT_COST).unwrap();
+        let ch = client_hash("regpass");
+        let password_hash =
+            bcrypt::hash(format!("{}{}", TEST_SERVER_SALT, ch), bcrypt::DEFAULT_COST).unwrap();
 
         setup_admin(&conn, "admin1", &password_hash, &totp_secret, &api_key_hash).unwrap();
 
-        let (device_id, _, _) = validate_device(&conn, &api_key_hash).unwrap().unwrap();
+        let (device_id, _, _) = validate_device(&conn, &api_key).unwrap().unwrap();
         let code = "test-code-abc-def";
         let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(10))
             .format("%Y-%m-%dT%H:%M:%SZ")
@@ -498,11 +675,11 @@ mod tests {
         let new_api_key = generate_api_key();
         let new_api_key_hash = hash_api_key(&new_api_key).unwrap();
 
-        let out = register_device(&conn, code, "regpass", &new_api_key_hash).unwrap();
+        let out = register_device(&conn, code, &ch, &new_api_key_hash, TEST_SERVER_SALT).unwrap();
         assert!(out.is_some());
         assert_eq!(out.as_deref(), Some(totp_secret.as_str()));
 
-        let validated = validate_device(&conn, &new_api_key_hash).unwrap();
+        let validated = validate_device(&conn, &new_api_key).unwrap();
         assert!(validated.is_some());
     }
 
@@ -512,10 +689,12 @@ mod tests {
         let api_key = generate_api_key();
         let api_key_hash = hash_api_key(&api_key).unwrap();
         let totp_secret = generate_totp_secret().unwrap();
-        let password_hash = bcrypt::hash("p", bcrypt::DEFAULT_COST).unwrap();
+        let ch = client_hash("p");
+        let password_hash =
+            bcrypt::hash(format!("{}{}", TEST_SERVER_SALT, ch), bcrypt::DEFAULT_COST).unwrap();
 
         setup_admin(&conn, "a", &password_hash, &totp_secret, &api_key_hash).unwrap();
-        let (device_id, _admin_id, _) = validate_device(&conn, &api_key_hash).unwrap().unwrap();
+        let (device_id, _admin_id, _) = validate_device(&conn, &api_key).unwrap().unwrap();
 
         let id = create_command(
             &conn,
@@ -525,6 +704,7 @@ mod tests {
             Some("continue"),
             Some("claude-4"),
             Some("cursor"),
+            None,
         )
         .unwrap();
 
@@ -534,9 +714,114 @@ mod tests {
         assert_eq!(cmd.6, Some("~/repos/foo".to_string()));
         assert_eq!(cmd.8, Some("claude-4".to_string()));
 
-        update_command(&conn, id, Some("done"), Some("output"), Some("summary")).unwrap();
+        update_command(
+            &conn,
+            id,
+            Some("done"),
+            Some("output"),
+            Some("summary"),
+            None,
+        )
+        .unwrap();
         let cmd2 = get_command(&conn, id).unwrap().unwrap();
         assert_eq!(cmd2.3, "done");
         assert_eq!(cmd2.4, Some("output".to_string()));
+    }
+
+    #[test]
+    fn add_repo_accepts_valid_path_under_repos() {
+        let conn = in_memory_db_with_migrations();
+        let api_key = generate_api_key();
+        let api_key_hash = hash_api_key(&api_key).unwrap();
+        let totp_secret = generate_totp_secret().unwrap();
+        let ch = client_hash("p");
+        let password_hash =
+            bcrypt::hash(format!("{}{}", TEST_SERVER_SALT, ch), bcrypt::DEFAULT_COST).unwrap();
+
+        setup_admin(&conn, "a", &password_hash, &totp_secret, &api_key_hash).unwrap();
+        let (_device_id, admin_id, _) = validate_device(&conn, &api_key).unwrap().unwrap();
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/home/testuser");
+        let result = add_repo(&conn, admin_id, "~/repos/my-project", Some("My Project"));
+        if let Some(h) = &old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+
+        assert!(result.is_ok());
+        let repos = list_repos(&conn, admin_id).unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].1, "/home/testuser/repos/my-project");
+    }
+
+    #[test]
+    fn add_repo_rejects_path_not_under_repos() {
+        let conn = in_memory_db_with_migrations();
+        let api_key = generate_api_key();
+        let api_key_hash = hash_api_key(&api_key).unwrap();
+        let totp_secret = generate_totp_secret().unwrap();
+        let ch = client_hash("p");
+        let password_hash =
+            bcrypt::hash(format!("{}{}", TEST_SERVER_SALT, ch), bcrypt::DEFAULT_COST).unwrap();
+
+        setup_admin(&conn, "a", &password_hash, &totp_secret, &api_key_hash).unwrap();
+        let (_device_id, admin_id, _) = validate_device(&conn, &api_key).unwrap().unwrap();
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/home/testuser");
+
+        let bad_paths = [
+            "/tmp/foo_repos_bar",
+            "~/repos_backup",
+            "/malicious/repos/../../../etc/passwd",
+        ];
+        for path in &bad_paths {
+            let result = add_repo(&conn, admin_id, path, None);
+            assert!(result.is_err(), "path {:?} should be rejected", path);
+        }
+
+        if let Some(h) = &old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn replace_repos_skips_invalid_paths() {
+        let conn = in_memory_db_with_migrations();
+        let api_key = generate_api_key();
+        let api_key_hash = hash_api_key(&api_key).unwrap();
+        let totp_secret = generate_totp_secret().unwrap();
+        let ch = client_hash("p");
+        let password_hash =
+            bcrypt::hash(format!("{}{}", TEST_SERVER_SALT, ch), bcrypt::DEFAULT_COST).unwrap();
+
+        setup_admin(&conn, "a", &password_hash, &totp_secret, &api_key_hash).unwrap();
+        let (_device_id, admin_id, _) = validate_device(&conn, &api_key).unwrap().unwrap();
+
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/home/testuser");
+
+        let paths = vec![
+            "~/repos/valid-project".to_string(),
+            "/tmp/foo_repos_bar".to_string(),
+            "~/repos/another-valid".to_string(),
+        ];
+        replace_repos(&conn, admin_id, &paths).unwrap();
+
+        let repos = list_repos(&conn, admin_id).unwrap();
+        assert_eq!(repos.len(), 2, "only valid paths should be added");
+        let paths: Vec<_> = repos.iter().map(|r| r.1.as_str()).collect();
+        assert!(paths.contains(&"/home/testuser/repos/valid-project"));
+        assert!(paths.contains(&"/home/testuser/repos/another-valid"));
+
+        if let Some(h) = &old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }

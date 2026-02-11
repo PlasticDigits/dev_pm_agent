@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 shared = { path = "../shared" }
+uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.11", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -23,3 +24,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 shellexpand = "2"
 futures-util = "0.3"
+sha2 = "0.10"
+walkdir = "2"
+chrono = "0.4"

@@ -10,8 +10,10 @@ pub struct Config {
     pub database_path: PathBuf,
     pub jwt_secret: String,
     pub jwt_ttl_secs: u64,
+    pub jwt_refresh_grace_secs: u64,
     pub executor_api_key: String,
     pub device_registration_code_ttl_secs: u64,
+    pub password_salt: String,
 }
 
 impl Config {
@@ -30,12 +32,18 @@ impl Config {
             .unwrap_or_else(|_| "3600".to_string())
             .parse()
             .unwrap_or(3600);
+        let jwt_refresh_grace_secs = std::env::var("JWT_REFRESH_GRACE_SECS")
+            .unwrap_or_else(|_| "86400".to_string())
+            .parse()
+            .unwrap_or(86400);
         let executor_api_key =
             std::env::var("EXECUTOR_API_KEY").map_err(|_| std::env::VarError::NotPresent)?;
         let device_registration_code_ttl_secs = std::env::var("DEVICE_REGISTRATION_CODE_TTL_SECS")
             .unwrap_or_else(|_| "600".to_string())
             .parse()
             .unwrap_or(600);
+        let password_salt =
+            std::env::var("PASSWORD_SALT").map_err(|_| std::env::VarError::NotPresent)?;
 
         Ok(Self {
             host,
@@ -43,8 +51,31 @@ impl Config {
             database_path,
             jwt_secret,
             jwt_ttl_secs,
+            jwt_refresh_grace_secs,
             executor_api_key,
             device_registration_code_ttl_secs,
+            password_salt,
         })
+    }
+
+    /// Build config for tests without reading env. Avoids env var races in parallel tests.
+    #[cfg(test)]
+    pub fn for_test(
+        database_path: PathBuf,
+        jwt_secret: impl Into<String>,
+        executor_api_key: impl Into<String>,
+        password_salt: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+            database_path,
+            jwt_secret: jwt_secret.into(),
+            jwt_ttl_secs: 3600,
+            jwt_refresh_grace_secs: 86400,
+            executor_api_key: executor_api_key.into(),
+            device_registration_code_ttl_secs: 600,
+            password_salt: password_salt.into(),
+        }
     }
 }
