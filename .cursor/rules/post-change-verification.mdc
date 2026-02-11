@@ -1,0 +1,14 @@
+---
+description: Always run format, tests, compile, and fix warnings after making changes
+alwaysApply: true
+---
+
+# Post-Change Verification
+
+After making code changes to this project, always run these commands before considering the work complete:
+
+1. **Format**: `cargo fmt`
+2. **Build (warnings as errors)**: `RUSTFLAGS="-D warnings" cargo build`
+3. **Tests**: `cargo test`
+
+Run them in that order. Fix any failures or warnings before finishing. The `RUSTFLAGS="-D warnings"` makes the build fail on any warning, so you must fix all warnings as part of each change. For Rust changes, this is the minimum verification step.

@@ -1,0 +1,10 @@
+# Executor configuration (env-based)
+#
+# The executor reads configuration from environment variables, not this file.
+# Set these in your shell or .env when running the executor:
+#
+# RELAYER_WS_URL     WebSocket URL to the relayer (default: ws://localhost:8080/ws)
+# EXECUTOR_API_KEY   API key for executor auth (required, same value as relayer's EXECUTOR_API_KEY)
+# DEFAULT_REPO       Default repo path when command has none (default: ~/repos/default)
+# TRANSLATOR_MODEL   Default model for translation (default: composer-1.5)
+# WORKLOAD_MODEL     Default model for workload execution (default: composer-1.5)

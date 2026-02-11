@@ -1,0 +1,16 @@
+# Gitleaks config for dev_pm_agent
+# Extends default rules from https://github.com/gitleaks/gitleaks/blob/master/config/gitleaks.toml
+
+title = "dev_pm_agent"
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Project-specific allowlists"
+paths = [
+  # Rust
+  '''(?:^|/)Cargo\.lock$''',
+  '''(?:^|/)target(?:/.*)?$''',
+  # Example/config files with placeholder values
+  '''(?:^|/)config/.*\.example\.(?:toml|yaml|yml|env)''',
+]

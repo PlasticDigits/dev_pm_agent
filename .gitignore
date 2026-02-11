@@ -1,0 +1,17 @@
+/target/
+Cargo.lock
+*.db
+data/
+.env
+.env.local
+*.log
+
+# Frontend
+apps/web/node_modules/
+apps/web/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

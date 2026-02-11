@@ -1,0 +1,60 @@
+# Dev PM Agent — Render Blueprint
+# See docs: https://docs.render.com/blueprint-spec
+#
+# Before deploy: Set JWT_SECRET and EXECUTOR_API_KEY for dev-pm-relayer in Render Dashboard.
+# After relayer deploys: Set VITE_RELAYER_URL for dev-pm-webapp (e.g. https://dev-pm-relayer.onrender.com).
+
+services:
+  # Backend: HTTP API + WebSocket, SQLite on persistent disk
+  - type: web
+    name: dev-pm-relayer
+    runtime: rust
+    plan: starter
+    region: oregon
+
+    buildCommand: cargo build --release -p relayer
+    startCommand: ./target/release/relayer
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: DATABASE_PATH
+        value: /data/relayer.db
+      - key: JWT_SECRET
+        sync: false
+      - key: EXECUTOR_API_KEY
+        sync: false
+
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+
+    buildFilter:
+      paths:
+        - crates/relayer/**
+        - crates/shared/**
+        - Cargo.toml
+        - Cargo.lock
+
+  # Frontend: Vite React SPA
+  - type: web
+    name: dev-pm-webapp
+    runtime: static
+    plan: free
+
+    buildCommand: cd apps/web && npm install && npm run build
+    staticPublishPath: apps/web/dist
+
+    envVars:
+      - key: VITE_RELAYER_URL
+        sync: false
+
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+    buildFilter:
+      paths:
+        - apps/web/**
