@@ -13,6 +13,9 @@ export interface Command {
   summary?: string;
   repo_path?: string;
   context_mode?: string;
+  translator_model?: string;
+  workload_model?: string;
+  cursor_chat_id?: string;
   created_at: string;
   updated_at: string;
 }

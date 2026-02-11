@@ -1,81 +1,132 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { login } from '../api/auth'
-import { getDeviceKey, setToken, setDeviceKey } from '../stores/auth'
+import { getDeviceKey, setDeviceKey, clearDeviceKey } from '../stores/auth'
+import { useAuth } from '../contexts/AuthContext'
 
 export default function Login() {
-  const [deviceApiKey, setDeviceApiKey] = useState(getDeviceKey() || '')
+  const { setToken } = useAuth()
+  const [keyCleared, setKeyCleared] = useState(false)
+  const savedKey = keyCleared ? null : getDeviceKey()
+  const [showDeviceField, setShowDeviceField] = useState(false)
+  const [deviceApiKey, setDeviceApiKey] = useState('')
   const [password, setPassword] = useState('')
   const [totpCode, setTotpCode] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const navigate = useNavigate()
 
+  const keyToUse = showDeviceField ? deviceApiKey : savedKey || ''
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setError('')
     setLoading(true)
     try {
-      const { token } = await login(deviceApiKey, password, totpCode)
+      const { token } = await login(keyToUse, password, totpCode)
       setToken(token)
-      setDeviceKey(deviceApiKey)
+      setDeviceKey(keyToUse)
       navigate('/chat')
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed')
+      const msg = err instanceof Error ? err.message : 'Login failed'
+      setError(msg)
+      if (msg.toLowerCase().includes('invalid device')) {
+        clearDeviceKey()
+        setKeyCleared(true)
+      }
     } finally {
       setLoading(false)
     }
   }
 
-  return (
-    <div className="flex min-h-screen flex-col items-center justify-center p-4">
-      <h1 className="text-2xl font-bold">Dev PM Agent</h1>
-      <p className="mt-2 text-gray-400">Login</p>
+  if (!savedKey && !showDeviceField) {
+    return (
+      <div className="mobile-frame flex min-h-screen flex-col gap-2 py-3">
+        <h1 className="title-main">Dev PM Agent</h1>
+        <p className="title-sub">Run setup first to create your account.</p>
+        <Link
+          to="/setup"
+          className="btn btn-primary mt-2 inline-flex w-fit"
+        >
+          Setup
+        </Link>
+      </div>
+    )
+  }
 
-      <form onSubmit={handleSubmit} className="mt-6 w-full max-w-sm space-y-4">
+  return (
+    <div className="mobile-frame flex min-h-screen flex-col gap-2 py-3">
+      <h1 className="title-main">Dev PM Agent</h1>
+      <p className="title-sub">Login</p>
+
+      <form onSubmit={handleSubmit} className="panel mt-1 w-full space-y-2.5">
+        {showDeviceField ? (
+          <div>
+            <label className="field-label">Device API key</label>
+            <input
+              type="text"
+              value={deviceApiKey}
+              onChange={(e) => setDeviceApiKey(e.target.value)}
+              placeholder="From bootstrap-device CLI"
+              className="input-control"
+              required
+            />
+          </div>
+        ) : (
+          <p className="text-sm text-muted">
+            Using saved device key.{' '}
+            <button
+              type="button"
+              onClick={() => setShowDeviceField(true)}
+              className="text-sm"
+            >
+              Use different device
+            </button>
+            {' • '}
+            <button
+              type="button"
+              onClick={() => {
+                clearDeviceKey()
+                setKeyCleared(true)
+              }}
+              className="text-sm"
+            >
+              Clear and run setup
+            </button>
+          </p>
+        )}
         <div>
-          <label className="block text-sm text-gray-400">Device API key</label>
-          <input
-            type="text"
-            value={deviceApiKey}
-            onChange={(e) => setDeviceApiKey(e.target.value)}
-            placeholder="From setup or device registration"
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-white"
-            required
-          />
-        </div>
-        <div>
-          <label className="block text-sm text-gray-400">Password</label>
+          <label className="field-label">Password</label>
           <input
             type="password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-white"
+            className="input-control"
             required
           />
         </div>
         <div>
-          <label className="block text-sm text-gray-400">TOTP code</label>
+          <label className="field-label">TOTP code</label>
           <input
             type="text"
             value={totpCode}
             onChange={(e) => setTotpCode(e.target.value)}
             placeholder="6 digits"
             maxLength={6}
-            className="mt-1 w-full rounded border border-gray-600 bg-gray-800 px-3 py-2 text-white"
+            className="input-control"
             required
           />
         </div>
-        {error && <p className="text-red-400">{error}</p>}
+        {error && <p className="error-text">{error}</p>}
         <button
           type="submit"
-          disabled={loading}
-          className="w-full rounded bg-blue-600 py-2 font-medium hover:bg-blue-700 disabled:opacity-50"
+          disabled={loading || !keyToUse}
+          className="btn btn-primary w-full"
         >
           {loading ? 'Logging in…' : 'Login'}
         </button>
-        <p className="text-center text-sm text-gray-400">
-          First time? <Link to="/setup" className="text-blue-400 hover:underline">Setup</Link>
+        <p className="text-center text-sm text-muted">
+          First time? <Link to="/setup">Setup</Link>
         </p>
       </form>
     </div>

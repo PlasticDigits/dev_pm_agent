@@ -10,8 +10,9 @@ export default defineConfig({
         changeOrigin: true,
       },
       '/ws': {
-        target: process.env.VITE_RELAYER_URL || 'ws://localhost:8080',
+        target: process.env.VITE_RELAYER_URL || 'http://localhost:8080',
         ws: true,
+        changeOrigin: true,
       },
     },
   },

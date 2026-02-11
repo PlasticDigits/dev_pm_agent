@@ -9,7 +9,14 @@ function authHeaders(token: string) {
 
 export async function createCommand(
   token: string,
-  data: { input: string; repo_path?: string; context_mode?: string; translator_model?: string; workload_model?: string }
+  data: {
+    input: string
+    repo_path?: string
+    context_mode?: string
+    translator_model?: string
+    workload_model?: string
+    cursor_chat_id?: string
+  }
 ) {
   const res = await fetch(`${BASE}/api/commands`, {
     method: 'POST',
@@ -26,4 +33,12 @@ export async function listCommands(token: string) {
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
+}
+
+export async function deleteCommand(token: string, id: string) {
+  const res = await fetch(`${BASE}/api/commands/${id}`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(await res.text());
 }
