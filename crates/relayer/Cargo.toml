@@ -3,6 +3,7 @@ name = "relayer"
 version = "0.1.0"
 edition = "2021"
 description = "Dev PM Agent relayer — auth, device registration, command relay"
+license = "AGPL-3.0"
 
 [[bin]]
 name = "relayer"

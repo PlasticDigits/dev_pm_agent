@@ -3,6 +3,7 @@ name = "executor"
 version = "0.1.0"
 edition = "2021"
 description = "Dev PM Agent executor — desktop daemon, Cursor CLI integration"
+license = "AGPL-3.0"
 
 [[bin]]
 name = "executor"

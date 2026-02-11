@@ -56,3 +56,7 @@ See [sprints/SPRINT_004.md](./sprints/SPRINT_004.md) for the full deployment che
 - `cargo run -p executor` — run daemon (default)
 - `cargo run -p executor -- bootstrap-device` — get device key for first-run setup (relayer must be running)
 - `cargo run -p executor -- register-device <word-code> <password>` — register new webapp device
+
+## License
+
+Licensed under the AGPL-3.0 License. See [LICENSE](./LICENSE) for details.
