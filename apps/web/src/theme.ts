@@ -28,7 +28,7 @@ export const THEMES = [
 
 export type ThemeId = (typeof THEMES)[number]['id']
 
-const DEFAULT_THEME: ThemeId = 'ink'
+const DEFAULT_THEME: ThemeId = 'amber'
 
 const THEME_KEY = 'devpm-theme'
 

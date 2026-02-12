@@ -16,7 +16,8 @@ export default function Login() {
   const [loading, setLoading] = useState(false)
   const navigate = useNavigate()
 
-  const keyToUse = showDeviceField ? deviceApiKey : savedKey || ''
+  const showDeviceInput = showDeviceField || !savedKey
+  const keyToUse = showDeviceInput ? deviceApiKey : savedKey || ''
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -39,35 +40,20 @@ export default function Login() {
     }
   }
 
-  if (!savedKey && !showDeviceField) {
-    return (
-      <div className="mobile-frame flex min-h-screen flex-col gap-2 py-3">
-        <h1 className="title-main">Dev PM Agent</h1>
-        <p className="title-sub">Run setup first to create your account.</p>
-        <Link
-          to="/setup"
-          className="btn btn-primary mt-2 inline-flex w-fit"
-        >
-          Setup
-        </Link>
-      </div>
-    )
-  }
-
   return (
     <div className="mobile-frame flex min-h-screen flex-col gap-2 py-3">
       <h1 className="title-main">Dev PM Agent</h1>
       <p className="title-sub">Login</p>
 
       <form onSubmit={handleSubmit} className="panel mt-1 w-full space-y-2.5">
-        {showDeviceField ? (
+        {showDeviceInput ? (
           <div>
             <label className="field-label">Device API key</label>
             <input
               type="text"
               value={deviceApiKey}
               onChange={(e) => setDeviceApiKey(e.target.value)}
-              placeholder="From bootstrap-device CLI"
+              placeholder="From bootstrap-device or register-device CLI"
               className="input-control"
               required
             />
