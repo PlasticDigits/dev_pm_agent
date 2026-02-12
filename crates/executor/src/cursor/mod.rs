@@ -446,21 +446,11 @@ async fn run_agent_in_repo_streaming(
                                     thinking.push_str(t);
                                 }
                             }
-                            ("assistant", "delta") => {
-                                // Delta events: small chunks of new text; append.
-                                if let Some(t) = val
-                                    .get("message")
-                                    .and_then(|m| m.get("content"))
-                                    .and_then(|c| c.get(0))
-                                    .and_then(|x| x.get("text"))
-                                    .and_then(|v| v.as_str())
-                                {
-                                    response.push_str(t);
-                                }
-                            }
                             ("assistant", _) => {
-                                // Full/accumulated assistant message: replace to avoid
-                                // duplication when both delta and full events are emitted.
+                                // Some models send delta chunks (small new text),
+                                // others send the full accumulated message each time.
+                                // Heuristic: if new text starts with existing response,
+                                // it's accumulated → replace. Otherwise → append.
                                 if let Some(t) = val
                                     .get("message")
                                     .and_then(|m| m.get("content"))
@@ -468,7 +458,11 @@ async fn run_agent_in_repo_streaming(
                                     .and_then(|x| x.get("text"))
                                     .and_then(|v| v.as_str())
                                 {
-                                    response = t.to_string();
+                                    if !response.is_empty() && t.starts_with(&response) {
+                                        response = t.to_string();
+                                    } else {
+                                        response.push_str(t);
+                                    }
                                 }
                             }
                             ("tool_call", sub) => {
