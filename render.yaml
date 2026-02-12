@@ -24,6 +24,9 @@ services:
         sync: false
       - key: EXECUTOR_API_KEY
         sync: false
+      - key: PASSWORD_SALT
+        sync: false
+
 
     disk:
       name: data
@@ -44,10 +47,6 @@ services:
 
     buildCommand: cd apps/web && npm install && npm run build
     staticPublishPath: apps/web/dist
-
-    envVars:
-      - key: VITE_RELAYER_URL
-        sync: false
 
     routes:
       - type: rewrite
