@@ -37,11 +37,10 @@ services:
         - Cargo.toml
         - Cargo.lock
 
-  # Frontend: Vite React SPA
+  # Frontend: Vite React SPA (static sites are free; plan not applicable)
   - type: web
     name: dev-pm-webapp
     runtime: static
-    plan: free
 
     buildCommand: cd apps/web && npm install && npm run build
     staticPublishPath: apps/web/dist
