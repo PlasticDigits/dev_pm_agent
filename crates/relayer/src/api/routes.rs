@@ -863,10 +863,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         .await;
 
     let mut rx = state.relay.subscribe();
+    let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            let json = match &msg {
-                BroadcastMessage::CommandNew(p) => serde_json::to_string(&shared::WsEnvelope {
+        loop {
+            tokio::select! {
+                recv = rx.recv() => {
+                    let msg = match recv {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    };
+                    let json = match &msg {
+                        BroadcastMessage::CommandNew(p) => serde_json::to_string(&shared::WsEnvelope {
                     version: 1,
                     r#type: shared::ws_types::COMMAND_NEW.to_string(),
                     payload: serde_json::to_value(p).unwrap(),
@@ -895,8 +903,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     })
                 }
             };
-            if let Ok(j) = json {
-                let _ = ws_tx.send(Message::Text(j.into())).await;
+                    if let Ok(j) = json {
+                        let _ = ws_tx.send(Message::Text(j.into())).await;
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    let _ = ws_tx.send(Message::Ping(axum::body::Bytes::new())).await;
+                }
             }
         }
     });

@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 /// Reduces timing side channel: always perform at least one bcrypt verify.
 const DUMMY_BCRYPT_HASH: &str = "$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/X4.VTtTfBd3c9zJWi";
 use rusqlite::{params, Connection};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -503,46 +503,30 @@ pub fn list_repos(
 }
 
 /// Validates that a repo path is under ~/repos/ with no path traversal.
-/// Expands tilde, normalizes the path (resolves . and ..), and ensures it
-/// starts with $HOME/repos/ or is exactly $HOME/repos.
+/// Returns the original path unchanged so the executor expands it with its own HOME.
+/// (The relayer may run on Render with HOME=/opt/render; storing ~/repos/X avoids
+/// persisting executor-invalid paths like /opt/render/repos/X.)
 fn validate_repo_path(path: &str) -> Result<String> {
-    let expanded = shellexpand::tilde(path).to_string();
-    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
-    let base = Path::new(&home).join("repos");
-    let base_str = base.to_string_lossy();
-
-    // Normalize path: resolve . and .. without requiring path to exist
-    let mut normalized = PathBuf::new();
-    for comp in Path::new(&expanded).components() {
-        match comp {
-            Component::Prefix(p) => normalized.push(p.as_os_str()),
-            Component::RootDir => normalized.push(comp.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(anyhow!("repo path must be under ~/repos/"));
-                }
-            }
-            Component::Normal(c) => normalized.push(c),
-        }
+    let path = path.trim();
+    let prefix = "~/repos";
+    if path != prefix && !path.starts_with(&format!("{}/", prefix)) {
+        return Err(anyhow!("repo path must be under ~/repos/"));
     }
-
-    let norm_str = normalized.to_string_lossy();
-    if norm_str == base_str || norm_str.starts_with(&format!("{}/", base_str)) {
-        Ok(expanded)
-    } else {
-        Err(anyhow!("repo path must be under ~/repos/"))
+    // Reject path traversal
+    if path.contains("..") {
+        return Err(anyhow!("repo path must be under ~/repos/"));
     }
+    Ok(path.to_string())
 }
 
 /// Add repo. Validates path is under ~/repos/ with strict path checks.
 pub fn add_repo(conn: &Connection, admin_id: Uuid, path: &str, name: Option<&str>) -> Result<Uuid> {
-    let expanded = validate_repo_path(path)?;
+    let path = validate_repo_path(path)?;
     let id = Uuid::new_v4();
     let now = chrono_iso8601();
     conn.execute(
         "INSERT INTO repos (id, admin_id, path, name, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id.to_string(), admin_id.to_string(), expanded, name, now],
+        params![id.to_string(), admin_id.to_string(), path, name, now],
     )?;
     Ok(id)
 }
@@ -556,11 +540,11 @@ pub fn replace_repos(conn: &Connection, admin_id: Uuid, paths: &[String]) -> Res
     )?;
     let now = chrono_iso8601();
     for path in paths {
-        if let Ok(expanded) = validate_repo_path(path) {
+        if let Ok(validated) = validate_repo_path(path) {
             let id = Uuid::new_v4();
             conn.execute(
                 "INSERT INTO repos (id, admin_id, path, name, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id.to_string(), admin_id.to_string(), expanded, None::<&str>, now],
+                params![id.to_string(), admin_id.to_string(), validated, None::<&str>, now],
             )?;
         }
     }
@@ -741,19 +725,11 @@ mod tests {
         setup_admin(&conn, "a", &password_hash, &totp_secret, &api_key_hash).unwrap();
         let (_device_id, admin_id, _) = validate_device(&conn, &api_key).unwrap().unwrap();
 
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", "/home/testuser");
         let result = add_repo(&conn, admin_id, "~/repos/my-project", Some("My Project"));
-        if let Some(h) = &old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-
         assert!(result.is_ok());
         let repos = list_repos(&conn, admin_id).unwrap();
         assert_eq!(repos.len(), 1);
-        assert_eq!(repos[0].1, "/home/testuser/repos/my-project");
+        assert_eq!(repos[0].1, "~/repos/my-project");
     }
 
     #[test]
@@ -769,9 +745,6 @@ mod tests {
         setup_admin(&conn, "a", &password_hash, &totp_secret, &api_key_hash).unwrap();
         let (_device_id, admin_id, _) = validate_device(&conn, &api_key).unwrap().unwrap();
 
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", "/home/testuser");
-
         let bad_paths = [
             "/tmp/foo_repos_bar",
             "~/repos_backup",
@@ -780,12 +753,6 @@ mod tests {
         for path in &bad_paths {
             let result = add_repo(&conn, admin_id, path, None);
             assert!(result.is_err(), "path {:?} should be rejected", path);
-        }
-
-        if let Some(h) = &old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
         }
     }
 
@@ -802,9 +769,6 @@ mod tests {
         setup_admin(&conn, "a", &password_hash, &totp_secret, &api_key_hash).unwrap();
         let (_device_id, admin_id, _) = validate_device(&conn, &api_key).unwrap().unwrap();
 
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", "/home/testuser");
-
         let paths = vec![
             "~/repos/valid-project".to_string(),
             "/tmp/foo_repos_bar".to_string(),
@@ -815,13 +779,7 @@ mod tests {
         let repos = list_repos(&conn, admin_id).unwrap();
         assert_eq!(repos.len(), 2, "only valid paths should be added");
         let paths: Vec<_> = repos.iter().map(|r| r.1.as_str()).collect();
-        assert!(paths.contains(&"/home/testuser/repos/valid-project"));
-        assert!(paths.contains(&"/home/testuser/repos/another-valid"));
-
-        if let Some(h) = &old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
+        assert!(paths.contains(&"~/repos/valid-project"));
+        assert!(paths.contains(&"~/repos/another-valid"));
     }
 }
