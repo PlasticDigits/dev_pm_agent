@@ -446,10 +446,8 @@ async fn run_agent_in_repo_streaming(
                                     thinking.push_str(t);
                                 }
                             }
-                            ("assistant", _) => {
-                                // With --stream-partial-output, assistant events are deltas
-                                // (small chunks of new text), not the full accumulated message.
-                                // Append just like thinking deltas.
+                            ("assistant", "delta") => {
+                                // Delta events: small chunks of new text; append.
                                 if let Some(t) = val
                                     .get("message")
                                     .and_then(|m| m.get("content"))
@@ -458,6 +456,19 @@ async fn run_agent_in_repo_streaming(
                                     .and_then(|v| v.as_str())
                                 {
                                     response.push_str(t);
+                                }
+                            }
+                            ("assistant", _) => {
+                                // Full/accumulated assistant message: replace to avoid
+                                // duplication when both delta and full events are emitted.
+                                if let Some(t) = val
+                                    .get("message")
+                                    .and_then(|m| m.get("content"))
+                                    .and_then(|c| c.get(0))
+                                    .and_then(|x| x.get("text"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    response = t.to_string();
                                 }
                             }
                             ("tool_call", sub) => {

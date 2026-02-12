@@ -2,11 +2,15 @@
 
 mod routes;
 
-use axum::{routing::get, Router};
+use axum::{
+    http::{header, HeaderValue, Method},
+    routing::get,
+    Router,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::oneshot;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::db::Db;
@@ -33,10 +37,22 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    let origins: Vec<HeaderValue> = state
+        .config
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(origins)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
     Router::new()
         .route("/health", get(health))

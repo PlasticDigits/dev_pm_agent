@@ -14,6 +14,8 @@ pub struct Config {
     pub executor_api_key: String,
     pub device_registration_code_ttl_secs: u64,
     pub password_salt: String,
+    /// Allowed CORS origins (e.g. frontend URL). Comma-separated in env.
+    pub cors_allowed_origins: Vec<String>,
 }
 
 impl Config {
@@ -44,6 +46,19 @@ impl Config {
             .unwrap_or(600);
         let password_salt =
             std::env::var("PASSWORD_SALT").map_err(|_| std::env::VarError::NotPresent)?;
+        let cors_allowed_origins = std::env::var("CORS_ALLOWED_ORIGINS")
+            .map(|s| {
+                s.split(',')
+                    .map(|o| o.trim().to_string())
+                    .filter(|o| !o.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|_| {
+                vec![
+                    "http://localhost:5173".to_string(),
+                    "http://127.0.0.1:5173".to_string(),
+                ]
+            });
 
         Ok(Self {
             host,
@@ -55,6 +70,7 @@ impl Config {
             executor_api_key,
             device_registration_code_ttl_secs,
             password_salt,
+            cors_allowed_origins,
         })
     }
 
@@ -76,6 +92,7 @@ impl Config {
             executor_api_key: executor_api_key.into(),
             device_registration_code_ttl_secs: 600,
             password_salt: password_salt.into(),
+            cors_allowed_origins: vec!["http://localhost:5173".to_string()],
         }
     }
 }
