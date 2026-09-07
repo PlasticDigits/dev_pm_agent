@@ -1,0 +1,12 @@
+when:
+  - event: [push, manual, pull_request]
+
+steps:
+  - name: gitleaks
+    image: zricethezav/gitleaks:v8.18.4
+    commands:
+      - gitleaks detect --source . --config .gitleaks.toml --verbose --redact --exit-code 1
+  - name: cargo
+    image: rust:1.88-bookworm
+    commands:
+      - cargo test --workspace
